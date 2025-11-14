@@ -6,131 +6,226 @@
  */
 #include "scheduler.h"
 #include <stddef.h>
+#include "stm32f1xx.h"
 
-/* Scheduler storage */
-sTask SCH_tasks_G[SCH_MAX_TASKS];
 
-/* Optional: global error code (not used heavily here) */
-static uint8_t Error_code_G = 0;
+/* Array of tasks */
+static sTask SCH_tasks_G[SCH_MAX_TASKS];
 
-/* Ensure TIME_CYCLE is sensible (set in main's MX_TIM2_Init) */
-extern int TIME_CYCLE;
+/* Linked-list for delta timing: next index or NO_TASK */
+#define NO_TASK_ID   0xFFFFFFFFU
+static uint32_t Next[SCH_MAX_TASKS];
 
-/* Initialize scheduler: clear task table */
+/* Index of head of delta-list */
+static uint32_t head = NO_TASK_ID;
+
+
+static inline uint32_t ms_to_ticks(uint32_t ms)
+{
+    if (TIME_CYCLE <= 0) return ms;
+    return (ms + TIME_CYCLE - 1) / TIME_CYCLE;   // round up
+}
+
+/* Disable IRQ macros */
+#define ENTER_CRITICAL() __disable_irq()
+#define EXIT_CRITICAL()  __enable_irq()
+
+
+/*Initialization*/
+
 void SCH_Init(void)
 {
+    ENTER_CRITICAL();
+
     for (uint32_t i = 0; i < SCH_MAX_TASKS; i++) {
         SCH_tasks_G[i].pTask = NULL;
         SCH_tasks_G[i].Delay = 0;
         SCH_tasks_G[i].Period = 0;
         SCH_tasks_G[i].RunMe = 0;
         SCH_tasks_G[i].TaskID = i;
+
+        Next[i] = NO_TASK_ID;
     }
 
-    /* Defensive: if TIME_CYCLE not set, default to 1 ms to avoid div/0 */
-    if (TIME_CYCLE <= 0) {
-        TIME_CYCLE = 1;
-    }
+    head = NO_TASK_ID;
 
-    Error_code_G = 0;
+    EXIT_CRITICAL();
 }
 
-/* Add a new task.
-   DELAY_ms and PERIOD_ms are in milliseconds.
-   Returns task index (0..SCH_MAX_TASKS-1) or SCH_MAX_TASKS on failure. */
-uint32_t SCH_Add_Task(void (*pFunction)(void), uint32_t DELAY_ms, uint32_t PERIOD_ms)
+
+/*Insert node*/
+
+static void insert_task(uint32_t id, uint32_t delay)
 {
-    if (pFunction == NULL) {
-        return SCH_MAX_TASKS;
+    uint32_t prev = NO_TASK_ID;
+    uint32_t cur = head;
+    uint32_t remaining = delay;
+
+    /* Walk until insert position */
+    while (cur != NO_TASK_ID && remaining > SCH_tasks_G[cur].Delay) {
+        remaining -= SCH_tasks_G[cur].Delay;
+        prev = cur;
+        cur = Next[cur];
     }
 
-    /* find first free slot */
-    uint32_t Index;
-    for (Index = 0; Index < SCH_MAX_TASKS; Index++) {
-        if (SCH_tasks_G[Index].pTask == NULL) break;
+    /* Insert id */
+    SCH_tasks_G[id].Delay = remaining;
+    Next[id] = cur;
+
+    if (cur != NO_TASK_ID) {
+        SCH_tasks_G[cur].Delay -= remaining;
     }
 
-    if (Index == SCH_MAX_TASKS) {
-        /* No space */
-        Error_code_G = 1; /* arbitrary error code */
-        return SCH_MAX_TASKS;
+    if (prev == NO_TASK_ID) {
+        head = id;
+    } else {
+        Next[prev] = id;
     }
-
-    /* Convert milliseconds to scheduler ticks (using TIME_CYCLE ms per tick) */
-    uint32_t delayTicks  = (TIME_CYCLE > 0) ? (DELAY_ms  / (uint32_t)TIME_CYCLE)  : DELAY_ms;
-    uint32_t periodTicks = (TIME_CYCLE > 0) ? (PERIOD_ms / (uint32_t)TIME_CYCLE) : PERIOD_ms;
-
-    /* If DELAY_ms was non-zero but smaller than TIME_CYCLE, we still want it to fire on next tick:
-       keep at least 1 tick for non-zero delays */
-    if ((DELAY_ms != 0) && (delayTicks == 0)) delayTicks = 1;
-    if ((PERIOD_ms != 0) && (periodTicks == 0)) periodTicks = 1;
-
-    SCH_tasks_G[Index].pTask  = pFunction;
-    SCH_tasks_G[Index].Delay  = delayTicks;
-    SCH_tasks_G[Index].Period = periodTicks;
-    SCH_tasks_G[Index].RunMe  = 0;
-    SCH_tasks_G[Index].TaskID = Index;
-
-    return Index;
 }
 
-/* Delete task by index.
-   Returns RETURN_NORMAL (0) on success, RETURN_ERROR (1) on failure. */
-uint8_t SCH_Delete_Task(uint32_t taskID)
-{
-    if (taskID >= SCH_MAX_TASKS) return RETURN_ERROR;
 
-    if (SCH_tasks_G[taskID].pTask == NULL) {
-        /* nothing to delete */
-        return RETURN_ERROR;
+/*Delete task*/
+
+static uint8_t remove_task(uint32_t id)
+{
+    uint32_t prev = NO_TASK_ID;
+    uint32_t cur = head;
+
+    while (cur != NO_TASK_ID && cur != id) {
+        prev = cur;
+        cur = Next[cur];
     }
 
-    SCH_tasks_G[taskID].pTask  = NULL;
-    SCH_tasks_G[taskID].Delay  = 0;
-    SCH_tasks_G[taskID].Period = 0;
-    SCH_tasks_G[taskID].RunMe  = 0;
-    /* TaskID field can remain equal to index */
+    if (cur == NO_TASK_ID) return RETURN_ERROR;
 
+    uint32_t next = Next[cur];
+
+    /* Fix delta times */
+    if (next != NO_TASK_ID) {
+        SCH_tasks_G[next].Delay += SCH_tasks_G[cur].Delay;
+    }
+
+    /* Remove */
+    if (prev == NO_TASK_ID)
+        head = next;
+    else
+        Next[prev] = next;
+
+    Next[id] = NO_TASK_ID;
     return RETURN_NORMAL;
 }
 
-/* This function should be called from a timer ISR every TIME_CYCLE ms.
-   It MUST be short and deterministic. */
-void SCH_Update(void)
-{
-    /* Defensive: if TIME_CYCLE invalid, nothing to do */
-    if (TIME_CYCLE <= 0) return;
 
-    for (uint32_t i = 0; i < SCH_MAX_TASKS; i++) {
-        if (SCH_tasks_G[i].pTask != NULL) {
-            if (SCH_tasks_G[i].Delay == 0) {
-                /* Task due to run */
-                SCH_tasks_G[i].RunMe += 1;
-                /* If periodic, reload Delay; if one-shot (Period==0) leave Delay==0 */
-                if (SCH_tasks_G[i].Period > 0) {
-                    SCH_tasks_G[i].Delay = SCH_tasks_G[i].Period;
-                }
-            } else {
-                SCH_tasks_G[i].Delay--;
-            }
-        }
+/*Add Task*/
+
+uint32_t SCH_Add_Task(void (*pFunction)(void), uint32_t DELAY_ms, uint32_t PERIOD_ms)
+{
+    if (pFunction == NULL) return SCH_MAX_TASKS;
+
+    /* Find free slot */
+    uint32_t id;
+    for (id = 0; id < SCH_MAX_TASKS; id++) {
+        if (SCH_tasks_G[id].pTask == NULL) break;
     }
+
+    if (id == SCH_MAX_TASKS) return SCH_MAX_TASKS;
+
+    uint32_t delayTicks  = ms_to_ticks(DELAY_ms);
+    uint32_t periodTicks = ms_to_ticks(PERIOD_ms);
+
+    if (DELAY_ms != 0 && delayTicks == 0) delayTicks = 1;
+    if (PERIOD_ms != 0 && periodTicks == 0) periodTicks = 1;
+
+    ENTER_CRITICAL();
+
+    SCH_tasks_G[id].pTask  = pFunction;
+    SCH_tasks_G[id].Delay  = 0;  // will be set by insert
+    SCH_tasks_G[id].Period = periodTicks;
+    SCH_tasks_G[id].RunMe  = 0;
+    Next[id] = NO_TASK_ID;
+
+    insert_task(id, delayTicks);
+
+    EXIT_CRITICAL();
+
+    return id;
 }
 
-/* Dispatcher: call due tasks. Should run in main loop (non-ISR). */
+
+/*Delete Task*/
+
+uint8_t SCH_Delete_Task(uint32_t id)
+{
+    if (id >= SCH_MAX_TASKS) return RETURN_ERROR;
+
+    ENTER_CRITICAL();
+
+    if (SCH_tasks_G[id].pTask == NULL) {
+        EXIT_CRITICAL();
+        return RETURN_ERROR;
+    }
+
+    remove_task(id);
+
+    SCH_tasks_G[id].pTask = NULL;
+    SCH_tasks_G[id].Delay = 0;
+    SCH_tasks_G[id].Period = 0;
+    SCH_tasks_G[id].RunMe = 0;
+
+    EXIT_CRITICAL();
+    return RETURN_NORMAL;
+}
+
+
+/*ISR: SCH_Update*/
+
+void SCH_Update(void)
+{
+    ENTER_CRITICAL();
+
+    if (head == NO_TASK_ID) {
+        EXIT_CRITICAL();
+        return;
+    }
+
+    /* Decrement delay at head */
+    if (SCH_tasks_G[head].Delay > 0)
+        SCH_tasks_G[head].Delay--;
+
+    /* Pop all ready tasks */
+    while (head != NO_TASK_ID && SCH_tasks_G[head].Delay == 0) {
+        uint32_t id = head;
+        head = Next[id];
+        Next[id] = NO_TASK_ID;
+        SCH_tasks_G[id].RunMe++;
+    }
+
+    EXIT_CRITICAL();
+}
+
+
+/*Dispatcher*/
+
 void SCH_Dispatch_Tasks(void)
 {
     for (uint32_t i = 0; i < SCH_MAX_TASKS; i++) {
-        if (SCH_tasks_G[i].pTask != NULL) {
-            if (SCH_tasks_G[i].RunMe > 0) {
-                /* run the task */
-                SCH_tasks_G[i].RunMe--;
-                (*(SCH_tasks_G[i].pTask))();
+        if (SCH_tasks_G[i].pTask && SCH_tasks_G[i].RunMe > 0) {
 
-                /* if one-shot then delete it */
-                if (SCH_tasks_G[i].Period == 0) {
-                    SCH_Delete_Task(i);
-                }
+            ENTER_CRITICAL();
+            SCH_tasks_G[i].RunMe--;
+            EXIT_CRITICAL();
+
+            /* Execute task */
+            (*SCH_tasks_G[i].pTask)();
+
+            /* Re-schedule periodic tasks */
+            if (SCH_tasks_G[i].Period > 0) {
+                ENTER_CRITICAL();
+                insert_task(i, SCH_tasks_G[i].Period);
+                EXIT_CRITICAL();
+            } else {
+                /* One-shot: delete it */
+                SCH_Delete_Task(i);
             }
         }
     }
